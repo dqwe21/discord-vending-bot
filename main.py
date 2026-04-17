@@ -65,3 +65,7 @@ if __name__ == "__main__":
         print("에러: DISCORD_TOKEN이 설정되지 않았습니다.")
     else:
         asyncio.run(run_servers())
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "I am awake!"}
