@@ -11,7 +11,7 @@ load_dotenv()
 
 # --- [설정 영역] ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN") # 디스코드 봇 토큰
-NOTIFICATION_CHANNEL_ID = 123456789012345678 # 알림을 보낼 디스코드 채널 ID (숫자)
+NOTIFICATION_CHANNEL_ID = 1491819968411467789 # 알림을 보낼 디스코드 채널 ID (숫자)
 
 # --- [봇 및 웹 서버 초기화] ---
 app = FastAPI()
