@@ -13,14 +13,25 @@ load_dotenv()
 
 # --- [설정 영역] ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+BANK_ACCOUNT = "3521856034173" # 요청하신 계좌번호
 
 # --- [초기화] ---
 app = FastAPI()
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# 입금 대기 명단
+# 입금 대기 명단 {이름: {amount: 금액, user_id: ID, msg_obj: DM메시지객체, expire_at: 시간}}
 pending_requests = {}
+
+# --- [계좌 복사 뷰] ---
+class CopyAccountView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="복사하기", style=discord.ButtonStyle.secondary)
+    async def copy_account(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 모바일에서 꾹 눌러 복사하기 편하도록 계좌번호만 전송
+        await interaction.response.send_message(BANK_ACCOUNT, ephemeral=True)
 
 # --- [충전 양식 모달] ---
 class ChargeModal(discord.ui.Modal, title="로벅스 충전 신청"):
@@ -29,10 +40,9 @@ class ChargeModal(discord.ui.Modal, title="로벅스 충전 신청"):
 
     async def on_submit(self, interaction: discord.Interaction):
         user_id = interaction.user.id
-        user_name = self.name.value.strip() # 공백 제거
+        user_name = self.name.value.strip()
         
         try:
-            # 금액에서 콤마나 '원' 글자 제거 후 숫자로 변환
             target_amount = int(self.amount.value.replace(",", "").replace("원", "").strip())
         except ValueError:
             await interaction.response.send_message("금액은 숫자만 입력해주세요!", ephemeral=True)
@@ -40,22 +50,35 @@ class ChargeModal(discord.ui.Modal, title="로벅스 충전 신청"):
 
         current_time = time.time()
         
-        # 중복 신청 처리: 동일 유저가 다시 신청하면 기존 기록 갱신
+        # 중복 신청 체크 (기존 로직 유지)
         for n, data in list(pending_requests.items()):
-            if data['user_id'] == user_id:
-                if n in pending_requests: del pending_requests[n]
+            if data['user_id'] == user_id and data['expire_at'] > current_time:
+                await interaction.response.send_message("이미 진행 중인 충전 신청이 있습니다. 5분 뒤에 다시 시도하세요.", ephemeral=True)
+                return
 
-        # 대기 등록 (5분)
+        # 1. 채널에는 간략하게 응답
+        await interaction.response.send_message("📬 DM을 확인해주세요!", ephemeral=True)
+
+        # 2. DM으로 상세 안내 발송
+        embed = discord.Embed(title="💳 입금 안내", color=0x5865F2)
+        embed.add_field(name="입금자명", value=f"`{user_name}`", inline=True)
+        embed.add_field(name="입금금액", value=f"`{target_amount:,}원`", inline=True)
+        embed.add_field(name="입금계좌", value=f"농협 `{BANK_ACCOUNT}`", inline=False)
+        embed.set_footer(text="5분 이내에 입금하지 않으면 자동으로 취소됩니다.")
+        
+        try:
+            dm_msg = await interaction.user.send(embed=embed, view=CopyAccountView())
+        except discord.Forbidden:
+            await interaction.followup.send("❌ DM을 보낼 수 없습니다. 설정을 확인해주세요.", ephemeral=True)
+            return
+
+        # 3. 대기 명단 등록 (메시지 객체 포함)
         pending_requests[user_name] = {
             "amount": target_amount,
             "user_id": user_id,
+            "msg_obj": dm_msg,
             "expire_at": current_time + 300
         }
-
-        await interaction.response.send_message(
-            f"✅ **충전 신청 완료**\n입금자명: `{user_name}`\n금액: `{target_amount:,}원`\n\n5분 이내에 농협 계좌로 입금해주세요!", 
-            ephemeral=True
-        )
 
 # --- [영업 버튼 뷰] ---
 class VendingView(discord.ui.View):
@@ -66,9 +89,24 @@ class VendingView(discord.ui.View):
     async def charge_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(ChargeModal())
 
+# --- [만료 체크 태스크] ---
+async def check_expiration():
+    while True:
+        current_time = time.time()
+        for name, data in list(pending_requests.items()):
+            if current_time > data['expire_at']:
+                try:
+                    # 시간이 지나면 DM 메시지 수정
+                    await data['msg_obj'].edit(content=f"❌ **충전 실패** (입금 시간 초과)", embed=None, view=None)
+                except:
+                    pass
+                del pending_requests[name]
+        await asyncio.sleep(10) # 10초마다 확인
+
 @bot.event
 async def on_ready():
     await bot.tree.sync()
+    bot.loop.create_task(check_expiration()) # 만료 체크 시작
     print(f"Logged in as {bot.user}")
 
 @bot.tree.command(name="영업", description="자판기 메뉴를 띄웁니다.")
@@ -76,57 +114,36 @@ async def open_shop(interaction: discord.Interaction):
     embed = discord.Embed(title="🛒 서지수 로벅스 샵", description="아래 버튼을 눌러 충전 신청을 해주세요.", color=0x5865F2)
     await interaction.response.send_message(embed=embed, view=VendingView())
 
-# --- [웹 서버: 입금 확인 핵심 로직] ---
+# --- [웹 서버: 입금 확인 신호 수신] ---
 @app.post("/charge")
 async def handle_charge(request: Request):
     try:
         data = await request.json()
         raw_message = data.get("message", "")
-        
-        if not raw_message:
-            return {"ok": False, "error": "메시지 없음"}
+        if not raw_message: return {"ok": False}
 
-        # 불필요한 알림 채널 메시지 전송은 요청하신 대로 삭제했습니다.
-
-        # 문자 분석 (정규표현식 보강)
-        # 1. 금액 추출: '입금' 뒤에 붙은 숫자들 추출 (콤마 제거 후 분석)
         clean_msg = raw_message.replace(",", "")
         amount_match = re.search(r'입금(\d+)', clean_msg)
-        
-        # 2. 이름 추출: 날짜/시간(예: 04/20 04:26) 뒤에 오는 한글 이름 추출
-        # 문자 패턴: ... 04/20 04:26 352-*** 김재형 잔액... 
-        # 이름은 보통 계좌번호 뒷부분 혹은 잔액 앞에 위치함
         name_match = re.search(r'([가-힣]{2,4})\s+잔액', clean_msg)
 
         if amount_match and name_match:
             amount = int(amount_match.group(1))
             name = name_match.group(1).strip()
-            current_time = time.time()
-
+            
             if name in pending_requests:
                 req = pending_requests[name]
-                
-                # 시간 만료 여부 및 금액 일치 확인
-                if current_time <= req['expire_at'] and req['amount'] == amount:
-                    user_id = req['user_id']
-                    user = await bot.fetch_user(user_id)
-                    
-                    if user:
-                        await user.send(f"✅ **자동 충전 완료!**\n{name}님, {amount:,}원이 성공적으로 충전되었습니다.")
-                    
+                if time.time() <= req['expire_at'] and req['amount'] == amount:
+                    # 입금 확인 시 DM 메시지 수정
+                    await req['msg_obj'].edit(content=f"✅ **{amount:,}원 충전 완료** [✅]", embed=None, view=None)
                     del pending_requests[name]
                     return {"ok": True, "status": "success"}
         
-        print(f"매칭 실패: 분석된 이름({name_match.group(1) if name_match else '없음'}), 금액({amount_match.group(1) if amount_match else '없음'})")
         return {"ok": True, "status": "no_match"}
-
     except Exception as e:
-        print(f"서버 에러: {e}")
         return {"ok": False, "error": str(e)}
 
 @app.get("/")
-async def root():
-    return {"status": "ok", "message": "I am awake!"}
+async def root(): return {"status": "ok"}
 
 async def run_servers():
     config = uvicorn.Config(app, host="0.0.0.0", port=88)
@@ -134,5 +151,4 @@ async def run_servers():
     await asyncio.gather(server.serve(), bot.start(DISCORD_TOKEN))
 
 if __name__ == "__main__":
-    if DISCORD_TOKEN:
-        asyncio.run(run_servers())
+    if DISCORD_TOKEN: asyncio.run(run_servers())
