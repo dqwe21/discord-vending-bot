@@ -7,13 +7,14 @@ import asyncio
 import os
 import time
 import re
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # --- [설정 영역] ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-BANK_ACCOUNT = "3521856034173" # 요청하신 계좌번호
+BANK_ACCOUNT = "3521856034173"
 
 # --- [초기화] ---
 app = FastAPI()
@@ -23,14 +24,12 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # 입금 대기 명단 {이름: {amount: 금액, user_id: ID, msg_obj: DM메시지객체, expire_at: 시간}}
 pending_requests = {}
 
-# --- [계좌 복사 뷰] ---
 class CopyAccountView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="복사하기", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="농협계좌 복사하기", style=discord.ButtonStyle.secondary)
     async def copy_account(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 모바일에서 꾹 눌러 복사하기 편하도록 계좌번호만 전송
         await interaction.response.send_message(BANK_ACCOUNT, ephemeral=True)
 
 # --- [충전 양식 모달] ---
@@ -50,44 +49,34 @@ class ChargeModal(discord.ui.Modal, title="로벅스 충전 신청"):
 
         current_time = time.time()
         
-        # 중복 신청 체크 (기존 로직 유지)
+        # 중복 신청 체크
         for n, data in list(pending_requests.items()):
             if data['user_id'] == user_id and data['expire_at'] > current_time:
                 await interaction.response.send_message("이미 진행 중인 충전 신청이 있습니다. 5분 뒤에 다시 시도하세요.", ephemeral=True)
                 return
 
-        # 1. 채널에는 간략하게 응답
         await interaction.response.send_message("📬 DM을 확인해주세요!", ephemeral=True)
 
-        # 2. DM으로 상세 안내 발송
-        embed = discord.Embed(title="💳 입금 안내", color=0x5865F2)
+        # DM 안내 임베드
+        embed = discord.Embed(title="💳 입금 대기 중", color=0x5865F2, timestamp=datetime.now())
+        embed.add_field(name="상태", value="`입금 확인 중...`", inline=False)
         embed.add_field(name="입금자명", value=f"`{user_name}`", inline=True)
-        embed.add_field(name="입금금액", value=f"`{target_amount:,}원`", inline=True)
+        embed.add_field(name="신청금액", value=f"`{target_amount:,}원`", inline=True)
         embed.add_field(name="입금계좌", value=f"농협 `{BANK_ACCOUNT}`", inline=False)
-        embed.set_footer(text="5분 이내에 입금하지 않으면 자동으로 취소됩니다.")
+        embed.set_footer(text="5분 이내 미입금 시 자동 취소")
         
         try:
             dm_msg = await interaction.user.send(embed=embed, view=CopyAccountView())
         except discord.Forbidden:
-            await interaction.followup.send("❌ DM을 보낼 수 없습니다. 설정을 확인해주세요.", ephemeral=True)
             return
 
-        # 3. 대기 명단 등록 (메시지 객체 포함)
         pending_requests[user_name] = {
             "amount": target_amount,
             "user_id": user_id,
             "msg_obj": dm_msg,
-            "expire_at": current_time + 300
+            "expire_at": current_time + 300,
+            "request_time": datetime.now()
         }
-
-# --- [영업 버튼 뷰] ---
-class VendingView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="충전", style=discord.ButtonStyle.green, custom_id="btn_charge")
-    async def charge_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(ChargeModal())
 
 # --- [만료 체크 태스크] ---
 async def check_expiration():
@@ -96,25 +85,37 @@ async def check_expiration():
         for name, data in list(pending_requests.items()):
             if current_time > data['expire_at']:
                 try:
-                    # 시간이 지나면 DM 메시지 수정
-                    await data['msg_obj'].edit(content=f"❌ **충전 실패** (입금 시간 초과)", embed=None, view=None)
+                    # 실패 임베드로 교체
+                    fail_embed = discord.Embed(title="❌ 충전 실패", color=0xFF0000, timestamp=datetime.now())
+                    fail_embed.add_field(name="사유", value="`입금 시간 초과 (5분 경과)`", inline=False)
+                    fail_embed.add_field(name="신청 정보", value=f"입금자: {name} / 금액: {data['amount']:,}원", inline=False)
+                    await data['msg_obj'].edit(content=None, embed=fail_embed, view=None)
                 except:
                     pass
                 del pending_requests[name]
-        await asyncio.sleep(10) # 10초마다 확인
+        await asyncio.sleep(10)
 
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    bot.loop.create_task(check_expiration()) # 만료 체크 시작
+    bot.loop.create_task(check_expiration())
     print(f"Logged in as {bot.user}")
 
 @bot.tree.command(name="영업", description="자판기 메뉴를 띄웁니다.")
 async def open_shop(interaction: discord.Interaction):
     embed = discord.Embed(title="🛒 서지수 로벅스 샵", description="아래 버튼을 눌러 충전 신청을 해주세요.", color=0x5865F2)
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label="충전", style=discord.ButtonStyle.green, custom_id="btn_charge"))
+    # 버튼 기능을 View 클래스로 연결해주는 부분이 필요하지만, 간결함을 위해 이전 VendingView를 쓰셔도 됩니다.
     await interaction.response.send_message(embed=embed, view=VendingView())
 
-# --- [웹 서버: 입금 확인 신호 수신] ---
+class VendingView(discord.ui.View):
+    def __init__(self): super().__init__(timeout=None)
+    @discord.ui.button(label="충전", style=discord.ButtonStyle.green, custom_id="btn_charge")
+    async def charge_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ChargeModal())
+
+# --- [웹 서버] ---
 @app.post("/charge")
 async def handle_charge(request: Request):
     try:
@@ -133,12 +134,17 @@ async def handle_charge(request: Request):
             if name in pending_requests:
                 req = pending_requests[name]
                 if time.time() <= req['expire_at'] and req['amount'] == amount:
-                    # 입금 확인 시 DM 메시지 수정
-                    await req['msg_obj'].edit(content=f"✅ **{amount:,}원 충전 완료** [✅]", embed=None, view=None)
+                    # 성공 임베드로 교체
+                    success_embed = discord.Embed(title="✅ 충전 완료", color=0x00FF00, timestamp=datetime.now())
+                    success_embed.add_field(name="상태", value="`입금 확인 및 충전 성공`", inline=False)
+                    success_embed.add_field(name="입금자명", value=f"`{name}`", inline=True)
+                    success_embed.add_field(name="충전금액", value=f"`{amount:,}원`", inline=True)
+                    success_embed.add_field(name="처리시각", value=f"`{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`", inline=False)
+                    
+                    await req['msg_obj'].edit(content=None, embed=success_embed, view=None)
                     del pending_requests[name]
-                    return {"ok": True, "status": "success"}
-        
-        return {"ok": True, "status": "no_match"}
+                    return {"ok": True}
+        return {"ok": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
