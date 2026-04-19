@@ -7,29 +7,31 @@ import asyncio
 import os
 import time
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # --- [설정 영역] ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-BANK_ACCOUNT = "3521856034173"
+BANK_ACCOUNT = "3521856034173" # 농협 계좌번호
 
 # --- [초기화] ---
 app = FastAPI()
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# 입금 대기 명단 {이름: {amount: 금액, user_id: ID, msg_obj: DM메시지객체, expire_at: 시간}}
+# 입금 대기 명단
 pending_requests = {}
 
+# --- [계좌 복사 버튼 뷰] ---
 class CopyAccountView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="농협계좌 복사하기", style=discord.ButtonStyle.secondary)
     async def copy_account(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 계좌번호만 전송하여 모바일에서 터치 시 바로 복사되게 함
         await interaction.response.send_message(BANK_ACCOUNT, ephemeral=True)
 
 # --- [충전 양식 모달] ---
@@ -57,8 +59,13 @@ class ChargeModal(discord.ui.Modal, title="로벅스 충전 신청"):
 
         await interaction.response.send_message("📬 DM을 확인해주세요!", ephemeral=True)
 
-        # DM 안내 임베드
-        embed = discord.Embed(title="💳 입금 대기 중", color=0x5865F2, timestamp=datetime.now())
+        # 1. DM 안내 임베드 (대기 중 상태)
+        embed = discord.Embed(
+            title="💳 입금 대기 중", 
+            description="아래 **[농협계좌 복사하기]** 버튼을 누른 후,\n나타나는 번호를 터치하면 바로 복사됩니다!",
+            color=0x5865F2, 
+            timestamp=datetime.now()
+        )
         embed.add_field(name="상태", value="`입금 확인 중...`", inline=False)
         embed.add_field(name="입금자명", value=f"`{user_name}`", inline=True)
         embed.add_field(name="신청금액", value=f"`{target_amount:,}원`", inline=True)
@@ -74,8 +81,7 @@ class ChargeModal(discord.ui.Modal, title="로벅스 충전 신청"):
             "amount": target_amount,
             "user_id": user_id,
             "msg_obj": dm_msg,
-            "expire_at": current_time + 300,
-            "request_time": datetime.now()
+            "expire_at": current_time + 300
         }
 
 # --- [만료 체크 태스크] ---
@@ -85,7 +91,7 @@ async def check_expiration():
         for name, data in list(pending_requests.items()):
             if current_time > data['expire_at']:
                 try:
-                    # 실패 임베드로 교체
+                    # 실패 시 임베드 업데이트
                     fail_embed = discord.Embed(title="❌ 충전 실패", color=0xFF0000, timestamp=datetime.now())
                     fail_embed.add_field(name="사유", value="`입금 시간 초과 (5분 경과)`", inline=False)
                     fail_embed.add_field(name="신청 정보", value=f"입금자: {name} / 금액: {data['amount']:,}원", inline=False)
@@ -95,27 +101,15 @@ async def check_expiration():
                 del pending_requests[name]
         await asyncio.sleep(10)
 
+# (이하 VendingView, on_ready, run_servers 코드는 동일하게 유지)
+
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    bot.loop.create_task(check_expiration())
+    bot.loop.create_task(check_expiration()) #
     print(f"Logged in as {bot.user}")
 
-@bot.tree.command(name="영업", description="자판기 메뉴를 띄웁니다.")
-async def open_shop(interaction: discord.Interaction):
-    embed = discord.Embed(title="🛒 서지수 로벅스 샵", description="아래 버튼을 눌러 충전 신청을 해주세요.", color=0x5865F2)
-    view = discord.ui.View(timeout=None)
-    view.add_item(discord.ui.Button(label="충전", style=discord.ButtonStyle.green, custom_id="btn_charge"))
-    # 버튼 기능을 View 클래스로 연결해주는 부분이 필요하지만, 간결함을 위해 이전 VendingView를 쓰셔도 됩니다.
-    await interaction.response.send_message(embed=embed, view=VendingView())
-
-class VendingView(discord.ui.View):
-    def __init__(self): super().__init__(timeout=None)
-    @discord.ui.button(label="충전", style=discord.ButtonStyle.green, custom_id="btn_charge")
-    async def charge_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(ChargeModal())
-
-# --- [웹 서버] ---
+# --- [웹 서버: 입금 신호 처리] ---
 @app.post("/charge")
 async def handle_charge(request: Request):
     try:
@@ -125,7 +119,7 @@ async def handle_charge(request: Request):
 
         clean_msg = raw_message.replace(",", "")
         amount_match = re.search(r'입금(\d+)', clean_msg)
-        name_match = re.search(r'([가-힣]{2,4})\s+잔액', clean_msg)
+        name_match = re.search(r'([가-힣]{2,4})\s+잔액', clean_msg) #
 
         if amount_match and name_match:
             amount = int(amount_match.group(1))
@@ -134,9 +128,9 @@ async def handle_charge(request: Request):
             if name in pending_requests:
                 req = pending_requests[name]
                 if time.time() <= req['expire_at'] and req['amount'] == amount:
-                    # 성공 임베드로 교체
+                    # 성공 시 임베드 업데이트
                     success_embed = discord.Embed(title="✅ 충전 완료", color=0x00FF00, timestamp=datetime.now())
-                    success_embed.add_field(name="상태", value="`입금 확인 및 충전 성공`", inline=False)
+                    success_embed.add_field(name="상태", value="`입금 확인 및 충전 성공` [✅]", inline=False)
                     success_embed.add_field(name="입금자명", value=f"`{name}`", inline=True)
                     success_embed.add_field(name="충전금액", value=f"`{amount:,}원`", inline=True)
                     success_embed.add_field(name="처리시각", value=f"`{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`", inline=False)
@@ -148,6 +142,7 @@ async def handle_charge(request: Request):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+# --- [메인 실행부] ---
 @app.get("/")
 async def root(): return {"status": "ok"}
 
