@@ -33,6 +33,26 @@ class CopyAccountView(discord.ui.View):
     async def copy_account(self, interaction: discord.Interaction, button: discord.ui.Button):
         # 계좌번호만 전송하여 모바일에서 터치 시 바로 복사되게 함
         await interaction.response.send_message(BANK_ACCOUNT, ephemeral=True)
+# --- [영업 버튼 뷰] ---
+class VendingView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None) # 서버 재시작 전까지 버튼 유지
+
+    @discord.ui.button(label="충전", style=discord.ButtonStyle.green, custom_id="btn_charge")
+    async def charge_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 버튼을 누르면 위에서 정의한 ChargeModal을 띄웁니다.
+        await interaction.response.send_modal(ChargeModal())
+
+# --- [슬래시 커맨드 등록] ---
+@bot.tree.command(name="영업", description="자판기 메뉴를 띄웁니다.")
+async def open_shop(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🛒 서지수 로벅스 샵", 
+        description="아래 버튼을 눌러 충전 신청을 해주세요.", 
+        color=0x5865F2
+    )
+    # 위에서 만든 VendingView(충전 버튼)를 함께 보냅니다.
+    await interaction.response.send_message(embed=embed, view=VendingView())
 
 # --- [충전 양식 모달] ---
 class ChargeModal(discord.ui.Modal, title="로벅스 충전 신청"):
